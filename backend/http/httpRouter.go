@@ -189,6 +189,7 @@ func StartHttp(ctx context.Context, storage *bolt.BoltStore, shutdownComplete ch
 	// ========================================
 	api.HandleFunc("GET /media/subtitles", withUser(subtitlesHandler))
 	api.HandleFunc("GET /media/audio", withUser(audioTrackHandler))
+	api.HandleFunc("GET /media/audio/progress", withUser(audioTrackProgressHandler))
 	api.HandleFunc("GET /media/metadata", withUser(metadataHandler))
 	api.HandleFunc("GET /media/lyrics", withUser(lyricsHandler))
 	publicApi.HandleFunc("GET /media/metadata", withHashFile(publicMetadataHandler))

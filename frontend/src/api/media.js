@@ -21,6 +21,18 @@ export async function getSubtitleContent(source, path, subtitleName, embedded = 
   }
 }
 
+// GET /api/media/audio/progress
+/** @returns {Promise<{extracting: boolean, seconds: number}>} progress of an in-flight audio track extraction */
+export async function getAudioTrackProgress(source, path, index) {
+  const apiPath = getApiPath('media/audio/progress', {
+    source: source,
+    path: path,
+    index: String(index),
+  });
+  const res = await fetchURL(apiPath);
+  return res.json();
+}
+
 // GET /api/media/lyrics
 export async function getLyrics(source, path) {
     const apiPath = getApiPath('media/lyrics', {

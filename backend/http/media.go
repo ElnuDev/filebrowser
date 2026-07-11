@@ -162,6 +162,58 @@ func audioTrackHandler(w http.ResponseWriter, r *http.Request, d *requestContext
 	return http.StatusOK, nil
 }
 
+// audioTrackProgressHandler reports the progress of an in-flight audio track extraction.
+// @Summary Get audio track extraction progress
+// @Description Reports how many seconds of audio an in-flight extraction has produced, so clients can display progress against the media duration.
+// @Tags Resources
+// @Accept json
+// @Produce json
+// @Param path query string true "Index path to the video file"
+// @Param source query string true "Source name for the desired source"
+// @Param index query int true "Stream index of the embedded audio track"
+// @Success 200 {object} map[string]interface{} "Extraction progress"
+// @Failure 400 {object} map[string]string "Bad request"
+// @Failure 403 {object} map[string]string "Forbidden"
+// @Failure 404 {object} map[string]string "Resource not found"
+// @Router /api/media/audio/progress [get]
+func audioTrackProgressHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+	path := r.URL.Query().Get("path")
+	source := r.URL.Query().Get("source")
+	indexParam := r.URL.Query().Get("index")
+
+	if path == "" || source == "" {
+		return http.StatusBadRequest, fmt.Errorf("path and source are required")
+	}
+	streamIndex, err := strconv.Atoi(indexParam)
+	if err != nil {
+		return http.StatusBadRequest, fmt.Errorf("index parameter is required and must be an integer")
+	}
+
+	fileInfo, err := files.FileInfoFaster(utils.FileOptions{
+		FollowSymlinks:    true,
+		Path:              path,
+		Source:            source,
+		Expand:            true,
+		Content:           false,
+		Metadata:          false,
+		ShowHidden:        d.user.ShowHidden,
+		HideFileExt:       d.user.HideFileExt,
+		SkipExtendedAttrs: false,
+	}, store.Access, d.user, store.Share)
+	if err != nil {
+		return errToStatus(err), err
+	}
+	if !strings.HasPrefix(fileInfo.Type, "video") {
+		return http.StatusNotFound, fmt.Errorf("file is not a video")
+	}
+
+	seconds, extracting := ffmpeg.AudioExtractionProgress(fileInfo.RealPath, streamIndex, fileInfo.ModTime)
+	return renderJSON(w, r, map[string]interface{}{
+		"extracting": extracting,
+		"seconds":    seconds,
+	})
+}
+
 func findSubtitleTrack(subtitles []utils.SubtitleTrack, name string, embedded bool) *utils.SubtitleTrack {
 	for i := range subtitles {
 		sub := &subtitles[i]

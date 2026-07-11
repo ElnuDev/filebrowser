@@ -231,7 +231,7 @@
     </button>
 
     <!-- Toast when you change playback modes or audio tracks in the media player -->
-    <div :class="['playback-toast', toastVisible ? 'visible' : '']">
+    <div :class="['playback-toast', toastVisible ? 'visible' : '', toastProgress !== null ? 'has-progress' : '']">
       <i v-if="toastMessage" class="material-symbols">graphic_eq</i>
       <!-- Loop icon for "single playback", "loop single file" and "loop all files" -->
       <i v-else-if="playbackMode === 'single' || playbackMode === 'loop-single' || playbackMode === 'loop-all'" class="material-symbols">
@@ -245,6 +245,11 @@
       <!-- Status indicator for loop -->
       <span v-if="!toastMessage && (playbackMode === 'single' || playbackMode === 'loop-single')" :class="[
           'status-indicator', playbackMode === 'loop-single' ? 'status-on' : 'status-off',]"></span>
+
+      <!-- Extraction progress while a non-native audio track loads -->
+      <div v-if="toastProgress !== null" class="toast-progress">
+        <div class="toast-progress-fill" :style="{ width: toastProgress + '%' }"></div>
+      </div>
     </div>
   </div>
 </template>
@@ -257,6 +262,7 @@ import { url } from '@/utils';
 import { getObjectProperty } from '@/utils/object.js';
 import { globalVars } from '@/utils/constants';
 import { getSubtitleFormatExtension } from '@/utils/subtitles';
+import { getAudioTrackProgress } from '@/api/media';
 
 const PLYR_CAPTION_SIZE_IDS = ['small', 'medium', 'large', 'xlarge'];
 /** Same localStorage key Plyr uses for `captions`, `language`, etc. (see Plyr defaults `storage.key`). */
@@ -310,6 +316,7 @@ export default {
       toastVisible: false,
       toastTimeout: null,
       toastMessage: null,
+      toastProgress: null, // 0-100 progress bar inside the toast; null hides it
 
       // Metadata & Art
       metadata: null, // Null by default, will be loaded from the audio file.
@@ -377,6 +384,11 @@ export default {
       altAudio: null,
       altAudioReady: false,
       altAudioLoadToken: 0,
+      // Loading UI for non-native tracks: the toast is delayed so cached
+      // extractions don't flash it, and extraction progress is polled while
+      // it is visible.
+      altAudioToastTimer: null,
+      altAudioProgressTimer: null,
       // Gain node used to silence the video's own audio without touching
       // video.muted (Plyr mirrors and persists the element's mute state).
       videoAudioCtx: null,
@@ -1081,8 +1093,6 @@ export default {
         this.teardownAltAudio();
         this.showToast(label);
       } else {
-        // Sticky: first-time extraction can take a while server-side.
-        this.showToast(`Loading ${label}…`, true);
         this.setupAltAudio(streamIndex);
       }
       this.updateAudioTrackMenuChecked();
@@ -1090,6 +1100,19 @@ export default {
     setupAltAudio(streamIndex) {
       this.teardownAltAudio();
       const token = ++this.altAudioLoadToken;
+      const loadingTrack = this.audioTracks.find((t) => t.index === streamIndex);
+      const loadingLabel = loadingTrack ? this.audioTrackLabel(loadingTrack) : '';
+      // Delay the sticky loading toast so an already-extracted track (which is
+      // ready near-instantly) doesn't flash it. Slow first-time extractions
+      // additionally get a progress bar polled from the server.
+      this.altAudioToastTimer = setTimeout(() => {
+        this.altAudioToastTimer = null;
+        if (token !== this.altAudioLoadToken || this.altAudioReady) {
+          return;
+        }
+        this.showToast(`Loading ${loadingLabel}…`, true);
+        this.pollAltAudioProgress(streamIndex, token);
+      }, 400);
       const audio = new Audio();
       audio.preload = 'auto';
       // Cookie-authenticated, same as the raw video stream. First request may take a
@@ -1107,8 +1130,8 @@ export default {
           return;
         }
         this.altAudioReady = true;
-        const track = this.audioTracks.find((t) => t.index === streamIndex);
-        this.showToast(track ? this.audioTrackLabel(track) : '');
+        this.clearAltAudioLoadingUI();
+        this.showToast(loadingLabel);
         this.ensureVideoAudioGraph();
         this.setVideoAudioSilenced(true);
         audio.volume = this.player?.volume ?? 1;
@@ -1136,6 +1159,7 @@ export default {
     },
     teardownAltAudio() {
       this.altAudioLoadToken++;
+      this.clearAltAudioLoadingUI();
       if (this.altAudio) {
         this.altAudio.pause();
         this.altAudio.removeAttribute('src');
@@ -1144,6 +1168,38 @@ export default {
       }
       this.altAudioReady = false;
       this.setVideoAudioSilenced(false);
+    },
+    clearAltAudioLoadingUI() {
+      if (this.altAudioToastTimer) {
+        clearTimeout(this.altAudioToastTimer);
+        this.altAudioToastTimer = null;
+      }
+      if (this.altAudioProgressTimer) {
+        clearInterval(this.altAudioProgressTimer);
+        this.altAudioProgressTimer = null;
+      }
+      this.toastProgress = null;
+    },
+    pollAltAudioProgress(streamIndex, generation) {
+      const poll = async () => {
+        if (generation !== this.altAudioLoadToken) {
+          return;
+        }
+        try {
+          const progress = await getAudioTrackProgress(this.req.source, this.req.path, streamIndex);
+          if (generation !== this.altAudioLoadToken) {
+            return;
+          }
+          const duration = this.mediaElement?.duration;
+          if (progress.extracting && duration > 0) {
+            this.toastProgress = Math.min(100, Math.round((progress.seconds / duration) * 100));
+          }
+        } catch {
+          // Progress is cosmetic; the audio element's own events handle failures.
+        }
+      };
+      void poll();
+      this.altAudioProgressTimer = setInterval(() => void poll(), 1000);
     },
     ensureVideoAudioGraph() {
       if (this.videoAudioGain || !this.mediaElement) {
@@ -3180,6 +3236,29 @@ export default {
 
 .playback-toast.visible {
   opacity: 1;
+}
+
+/* Extra room for the extraction progress bar pinned to the toast's bottom edge */
+.playback-toast.has-progress {
+  padding-bottom: 22px;
+}
+
+.playback-toast .toast-progress {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 9px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.25);
+  overflow: hidden;
+}
+
+.playback-toast .toast-progress-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: white;
+  transition: width 0.6s linear;
 }
 
 .playback-toast .material-symbols {

@@ -1,6 +1,8 @@
 package ffmpeg
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +22,25 @@ import (
 // audioExtractLocks serializes extraction per cache file so concurrent requests
 // for the same track don't run duplicate ffmpeg processes.
 var audioExtractLocks sync.Map
+
+// audioExtractProgress tracks how many seconds of audio each in-flight
+// extraction has written, so clients can poll for progress.
+var audioExtractProgress sync.Map
+
+func audioTrackKey(videoPath string, streamIndex int, modtime time.Time) string {
+	return fmt.Sprintf("%s:%d:%d", videoPath, modtime.Unix(), streamIndex)
+}
+
+// AudioExtractionProgress reports how many seconds of audio an in-flight
+// extraction for the given track has produced so far. The second return is
+// false when no extraction is currently running (not started, or finished).
+func AudioExtractionProgress(videoPath string, streamIndex int, modtime time.Time) (float64, bool) {
+	v, ok := audioExtractProgress.Load(audioTrackKey(videoPath, streamIndex, modtime))
+	if !ok {
+		return 0, false
+	}
+	return v.(float64), true
+}
 
 // DetectAudioTracks detects embedded audio streams using ffprobe.
 // Returns nil if ffprobe is not available or fails. Results are cached by path + modtime.
@@ -120,8 +142,8 @@ func ExtractAudioTrack(ctx context.Context, videoPath string, streamIndex int, c
 	if cacheDir == "" {
 		cacheDir = os.TempDir()
 	}
-	cacheKey := utils.HashSHA256(fmt.Sprintf("%s:%d:%d", videoPath, modtime.Unix(), streamIndex))
-	cachePath := filepath.Join(cacheDir, "audio_tracks", cacheKey+ext)
+	trackKey := audioTrackKey(videoPath, streamIndex, modtime)
+	cachePath := filepath.Join(cacheDir, "audio_tracks", utils.HashSHA256(trackKey)+ext)
 
 	lock, _ := audioExtractLocks.LoadOrStore(cachePath, &sync.Mutex{})
 	mu := lock.(*sync.Mutex)
@@ -138,6 +160,8 @@ func ExtractAudioTrack(ctx context.Context, videoPath string, streamIndex int, c
 	tmpPath := cachePath + ".tmp" + ext
 	args := []string{
 		"-y",
+		"-nostats",
+		"-progress", "pipe:1",
 		"-i", videoPath,
 		"-map", fmt.Sprintf("0:%d", streamIndex),
 		"-map_chapters", "-1",
@@ -146,11 +170,32 @@ func ExtractAudioTrack(ctx context.Context, videoPath string, streamIndex int, c
 	args = append(args, codecArgs...)
 	args = append(args, "-f", format, tmpPath)
 
+	audioExtractProgress.Store(trackKey, float64(0))
+	defer audioExtractProgress.Delete(trackKey)
+
 	cmd := exec.CommandContext(ctx, settings.Env.FFmpegPath, args...)
-	output, err := cmd.CombinedOutput()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		return "", "", fmt.Errorf("audio track extraction failed: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return "", "", fmt.Errorf("audio track extraction failed: %v", err)
+	}
+	// ffmpeg emits key=value blocks on stdout every ~0.5s; out_time_us is the
+	// output timestamp in microseconds ("N/A" until the first frame).
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		if v, ok := strings.CutPrefix(scanner.Text(), "out_time_us="); ok {
+			if us, parseErr := strconv.ParseInt(v, 10, 64); parseErr == nil {
+				audioExtractProgress.Store(trackKey, float64(us)/1e6)
+			}
+		}
+	}
+	if err := cmd.Wait(); err != nil {
 		os.Remove(tmpPath)
-		logger.Debugf("audio track extraction failed for %s stream %d: %v: %s", videoPath, streamIndex, err, string(output))
+		logger.Debugf("audio track extraction failed for %s stream %d: %v: %s", videoPath, streamIndex, err, stderr.String())
 		return "", "", fmt.Errorf("audio track extraction failed: %v", err)
 	}
 	if err := os.Rename(tmpPath, cachePath); err != nil {
