@@ -269,6 +269,8 @@ const PLYR_CAPTION_SIZE_IDS = ['small', 'medium', 'large', 'xlarge'];
 const PLYR_LOCALSTORAGE_KEY = 'plyr';
 /** Custom field inside Plyr’s JSON blob so caption size travels with other Plyr prefs. */
 const PLYR_CAPTION_SIZE_FIELD = 'captionSize';
+/** Persisted dub choice ({language, title}); matched across files by language with title fallback. */
+const PLYR_AUDIO_PREF_FIELD = 'audioTrackPreference';
 
 export default {
   name: "plyrViewer",
@@ -997,6 +999,72 @@ export default {
         default: return 'Medium';
       }
     },
+    getStoredAudioTrackPreference() {
+      try {
+        const raw = localStorage.getItem(PLYR_LOCALSTORAGE_KEY);
+        if (!raw) {
+          return null;
+        }
+        const pref = getObjectProperty(JSON.parse(raw), PLYR_AUDIO_PREF_FIELD);
+        if (pref && typeof pref === 'object' && (pref.language || pref.title)) {
+          return pref;
+        }
+      } catch {
+        /* ignore */
+      }
+      return null;
+    },
+    setStoredAudioTrackPreference(track) {
+      const language = track.language && track.language !== 'und' ? track.language : null;
+      const title = track.title || null;
+      // A track with no language and no title can't be matched in other files;
+      // clear the preference instead of letting a stale one override this choice.
+      this._mergePlyrStorage({
+        [PLYR_AUDIO_PREF_FIELD]: language || title ? { language, title } : null,
+      });
+    },
+    /** 'ja' and 'jpn' tag the same language; compare display names so tags from different release groups still match. */
+    normalizedAudioLanguage(code) {
+      if (!code || code === 'und') {
+        return null;
+      }
+      try {
+        return (new Intl.DisplayNames(['en'], { type: 'language' }).of(code) || code).toLowerCase();
+      } catch {
+        return code.toLowerCase();
+      }
+    },
+    findPreferredAudioTrack() {
+      const pref = this.getStoredAudioTrackPreference();
+      if (!pref) {
+        return null;
+      }
+      const prefLang = this.normalizedAudioLanguage(pref.language);
+      if (prefLang) {
+        const byLang = this.audioTracks.find(
+          (t) => this.normalizedAudioLanguage(t.language) === prefLang
+        );
+        if (byLang) {
+          return byLang;
+        }
+      }
+      if (pref.title) {
+        const title = pref.title.toLowerCase();
+        return this.audioTracks.find((t) => (t.title || '').toLowerCase() === title) || null;
+      }
+      return null;
+    },
+    /** Re-apply the persisted dub choice to this file (e.g. Japanese stays selected across episodes). */
+    restoreAudioTrackPreference() {
+      // Same gate as the menu: switching needs the authenticated media API.
+      if (this.previewType !== 'video' || this.audioTracks.length < 2 || getters.isShare()) {
+        return;
+      }
+      const track = this.findPreferredAudioTrack();
+      if (track) {
+        this.selectAudioTrack(track.index, { persist: false });
+      }
+    },
     audioTrackLabel(track) {
       let lang = '';
       if (track.language && track.language !== 'und') {
@@ -1082,13 +1150,16 @@ export default {
       }
       this.setAudioTrackMenuButtonLabel(this.player);
     },
-    selectAudioTrack(streamIndex) {
+    selectAudioTrack(streamIndex, { persist = true } = {}) {
       if (streamIndex === this.currentAudioTrackIndex) {
         return;
       }
       this.selectedAudioTrackIndex = streamIndex;
       const track = this.audioTracks.find((t) => t.index === streamIndex);
       const label = track ? this.audioTrackLabel(track) : '';
+      if (persist && track) {
+        this.setStoredAudioTrackPreference(track);
+      }
       if (streamIndex === this.nativeAudioTrackIndex) {
         this.teardownAltAudio();
         this.showToast(label);
@@ -1519,6 +1590,7 @@ export default {
       if (this.previewType === 'video') {
         this.applyCaptionSizeClass();
         this.syncCaptionSizeSettingsVisibility();
+        this.restoreAudioTrackPreference();
       }
       if (this.previewType === 'video' || this.previewType === 'audio') {
         this.setupDoubleTapSeek();
