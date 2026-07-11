@@ -60,6 +60,7 @@ type ExtendedFileInfo struct {
 	FileInfo
 	Content      string                `json:"content,omitempty"`      // text content of a file, if requested
 	Subtitles    []utils.SubtitleTrack `json:"subtitles,omitempty"`    // subtitles for video files
+	AudioTracks  []utils.AudioTrack    `json:"audioTracks,omitempty"`  // embedded audio tracks for video files
 	Metadata     *MediaMetadata        `json:"metadata,omitempty"`     // media metadata for audio/video files (includes duration)
 	Checksums    map[string]string     `json:"checksums,omitempty"`    // checksums for the file
 	Token        string                `json:"token,omitempty"`        // token for the file -- used for sharing

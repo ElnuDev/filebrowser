@@ -346,6 +346,7 @@ func processContent(info *iteminfo.ExtendedFileInfo, idx *indexing.Index, opts u
 			subtitles := ffmpeg.DetectEmbeddedSubtitles(info.RealPath, info.ModTime)
 			info.Subtitles = append(info.Subtitles, subtitles...)
 		}
+		info.AudioTracks = ffmpeg.DetectAudioTracks(info.RealPath, info.ModTime)
 		return
 	}
 

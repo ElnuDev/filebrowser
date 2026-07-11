@@ -230,19 +230,20 @@
       <i :class="mobileLyricsScrollLocked ? 'material-symbols-outlined' : 'material-symbols'">{{ mobileLyricsScrollLocked ? 'lock_open' : 'lock' }}</i>
     </button>
 
-    <!-- Toast when you change playback modes in the media player -->
+    <!-- Toast when you change playback modes or audio tracks in the media player -->
     <div :class="['playback-toast', toastVisible ? 'visible' : '']">
+      <i v-if="toastMessage" class="material-symbols">graphic_eq</i>
       <!-- Loop icon for "single playback", "loop single file" and "loop all files" -->
-      <i v-if="playbackMode === 'single' || playbackMode === 'loop-single' || playbackMode === 'loop-all'" class="material-symbols">
+      <i v-else-if="playbackMode === 'single' || playbackMode === 'loop-single' || playbackMode === 'loop-all'" class="material-symbols">
         {{ playbackMode === 'loop-single' ? 'repeat_one' : 'repeat' }} <!-- eslint-disable-line @intlify/vue-i18n/no-raw-text -->
       </i>
       <i v-else-if="playbackMode === 'shuffle'" class="material-symbols">shuffle</i>
       <i v-else class="material-symbols">playlist_play</i>
 
-      <span>{{ playbackModeMessage }}</span>
+      <span>{{ toastMessage || playbackModeMessage }}</span>
 
       <!-- Status indicator for loop -->
-      <span v-if="playbackMode === 'single' || playbackMode === 'loop-single'" :class="[
+      <span v-if="!toastMessage && (playbackMode === 'single' || playbackMode === 'loop-single')" :class="[
           'status-indicator', playbackMode === 'loop-single' ? 'status-on' : 'status-off',]"></span>
     </div>
   </div>
@@ -308,6 +309,7 @@ export default {
       // Toast
       toastVisible: false,
       toastTimeout: null,
+      toastMessage: null,
 
       // Metadata & Art
       metadata: null, // Null by default, will be loaded from the audio file.
@@ -366,6 +368,19 @@ export default {
       // Plyr instance
       player: null,
       captionSizeMenuInitialized: false,
+
+      // Embedded audio tracks (video only). The browser plays the container's
+      // default track natively; other tracks are extracted server-side and play
+      // through a hidden <audio> element kept in sync with the video.
+      audioTrackMenuInitialized: false,
+      selectedAudioTrackIndex: null, // stream index of the active track; null = native default
+      altAudio: null,
+      altAudioReady: false,
+      altAudioLoadToken: 0,
+      // Gain node used to silence the video's own audio without touching
+      // video.muted (Plyr mirrors and persists the element's mute state).
+      videoAudioCtx: null,
+      videoAudioGain: null,
     };
   },
   watch: {
@@ -517,6 +532,18 @@ export default {
     hasSubtitles() {
       return this.subtitlesList && this.subtitlesList.length > 0;
     },
+    audioTracks() {
+      if (this.previewType !== 'video') return [];
+      return this.req.audioTracks || [];
+    },
+    nativeAudioTrackIndex() {
+      if (!this.audioTracks.length) return null;
+      const def = this.audioTracks.find((t) => t.default);
+      return (def || this.audioTracks[0]).index;
+    },
+    currentAudioTrackIndex() {
+      return this.selectedAudioTrackIndex ?? this.nativeAudioTrackIndex;
+    },
     mediaElement() {
       if (this.useDefaultMediaPlayer) {
         return this.previewType === 'video'
@@ -594,10 +621,11 @@ export default {
       ];
       return {
         controls: this.isMobile ? controlsMobile : controlsDesktop,
-        settings: ['captions', 'captionSize', 'quality', 'speed', 'playback'],
+        settings: ['captions', 'captionSize', 'audioTrack', 'quality', 'speed', 'playback'],
         i18n: {
           playback: 'Playback',
           captionSize: 'Caption size',
+          audioTrack: 'Audio',
         },
         speed: {
           selected: 1,
@@ -752,6 +780,12 @@ export default {
     },
     destroyPlyr() {
       if (this.player) {
+        this.teardownAltAudio();
+        if (this.videoAudioCtx) {
+          this.videoAudioCtx.close().catch(() => {});
+          this.videoAudioCtx = null;
+          this.videoAudioGain = null;
+        }
         this.teardownVideoSwipeGestures();
         this.teardownDoubleTapSeek();
         this.clearMediaSession();
@@ -761,6 +795,8 @@ export default {
         this.player = null;
         this.playbackMenuInitialized = false;
         this.captionSizeMenuInitialized = false;
+        this.audioTrackMenuInitialized = false;
+        this.selectedAudioTrackIndex = null;
         this.lastAppliedMode = null;
         // This should fix (most of) the "Invalid URI" warns, meanwhile we still destroying plyr.
         // Somehow firefox will still trying to "load" the empty source which causes the warn.
@@ -792,16 +828,19 @@ export default {
         const settingsMenu = this.player.elements.settings?.menu;
         const playbackBtn = this.player.elements.settings?.buttons?.playback;
         const captionSizeBtn = this.player.elements.settings?.buttons?.captionSize;
+        const audioTrackBtn = this.player.elements.settings?.buttons?.audioTrack;
         const menuOpen =
           settingsMenu
           && settingsMenu.style.display !== 'none'
           && settingsMenu.getAttribute('hidden') === null;
         const needPlayback = playbackBtn && !this.playbackMenuInitialized;
         const needCaptionSize = captionSizeBtn && !this.captionSizeMenuInitialized;
+        const needAudioTrack = audioTrackBtn && !this.audioTrackMenuInitialized;
 
-        if (menuOpen || needPlayback || needCaptionSize) {
+        if (menuOpen || needPlayback || needCaptionSize || needAudioTrack) {
           this.applyCustomPlaybackSettings(this.player);
           this.applyCustomCaptionSizeSettings(this.player);
+          this.applyCustomAudioTrackSettings(this.player);
         }
       } catch (error) {
         console.error('Error ensuring playback mode applied:', error);
@@ -946,6 +985,209 @@ export default {
         default: return 'Medium';
       }
     },
+    audioTrackLabel(track) {
+      let lang = '';
+      if (track.language && track.language !== 'und') {
+        try {
+          lang = new Intl.DisplayNames([this.$i18n?.locale || 'en'], { type: 'language' }).of(track.language) || track.language;
+        } catch {
+          lang = track.language;
+        }
+      }
+      // Titles are often release-group tags; keep the language primary when both exist.
+      if (lang && track.title && track.title.toLowerCase() !== lang.toLowerCase()) {
+        return `${lang} — ${track.title}`;
+      }
+      return lang || track.title || track.name || `Track ${track.index}`;
+    },
+    setAudioTrackMenuButtonLabel(player) {
+      const btn = player.elements.settings?.buttons?.audioTrack;
+      if (!btn) return;
+      const title = player.config.i18n?.audioTrack || 'Audio';
+      const current = this.audioTracks.find((t) => t.index === this.currentAudioTrackIndex);
+      const span = btn.querySelector('span');
+      span.textContent = '';
+      span.append(`${title}: `);
+      const value = document.createElement('span');
+      value.className = 'plyr__menu__value';
+      value.textContent = current ? this.audioTrackLabel(current) : '';
+      span.appendChild(value);
+    },
+    applyCustomAudioTrackSettings(player) {
+      if (this.audioTrackMenuInitialized) {
+        return;
+      }
+      try {
+        const btn = player.elements.settings?.buttons?.audioTrack;
+        const panel = player.elements.settings?.panels?.audioTrack;
+        if (!btn || !panel) {
+          return;
+        }
+
+        // Track switching needs the authenticated media API; hide on public shares.
+        if (this.previewType !== 'video' || this.audioTracks.length < 2 || getters.isShare()) {
+          btn.setAttribute('hidden', '');
+          this.audioTrackMenuInitialized = true;
+          return;
+        }
+
+        const title = player.config.i18n?.audioTrack || 'Audio';
+        btn.removeAttribute('hidden');
+        this.setAudioTrackMenuButtonLabel(player);
+        panel.querySelector('.plyr__control--back span[aria-hidden="true"]').textContent = title;
+
+        const menu = panel.querySelector('div[role="menu"]');
+        menu.textContent = '';
+        this.audioTracks.forEach((track) => {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.setAttribute('data-plyr', 'audio-track');
+          button.setAttribute('role', 'menuitemradio');
+          button.className = 'plyr__control';
+          button.setAttribute('aria-checked', String(track.index === this.currentAudioTrackIndex));
+          button.value = String(track.index);
+          const span = document.createElement('span');
+          span.textContent = this.audioTrackLabel(track);
+          button.appendChild(span);
+          button.addEventListener('click', () => {
+            this.selectAudioTrack(track.index);
+          });
+          menu.appendChild(button);
+        });
+
+        this.audioTrackMenuInitialized = true;
+      } catch (error) {
+        console.error('Error applying audio track settings:', error);
+      }
+    },
+    updateAudioTrackMenuChecked() {
+      if (!this.player) return;
+      const panel = this.player.elements.settings?.panels?.audioTrack;
+      if (panel) {
+        panel.querySelectorAll('button[data-plyr="audio-track"]').forEach((btn) => {
+          btn.setAttribute('aria-checked', String(Number(btn.value) === this.currentAudioTrackIndex));
+        });
+      }
+      this.setAudioTrackMenuButtonLabel(this.player);
+    },
+    selectAudioTrack(streamIndex) {
+      if (streamIndex === this.currentAudioTrackIndex) {
+        return;
+      }
+      this.selectedAudioTrackIndex = streamIndex;
+      const track = this.audioTracks.find((t) => t.index === streamIndex);
+      const label = track ? this.audioTrackLabel(track) : '';
+      if (streamIndex === this.nativeAudioTrackIndex) {
+        this.teardownAltAudio();
+        this.showToast(label);
+      } else {
+        // Sticky: first-time extraction can take a while server-side.
+        this.showToast(`Loading ${label}…`, true);
+        this.setupAltAudio(streamIndex);
+      }
+      this.updateAudioTrackMenuChecked();
+    },
+    setupAltAudio(streamIndex) {
+      this.teardownAltAudio();
+      const token = ++this.altAudioLoadToken;
+      const audio = new Audio();
+      audio.preload = 'auto';
+      // Cookie-authenticated, same as the raw video stream. First request may take a
+      // few seconds while the server extracts the track; native audio keeps playing
+      // until this element is ready.
+      audio.src = url.getApiPath('media/audio', {
+        path: this.req.path,
+        source: this.req.source,
+        index: String(streamIndex),
+      });
+      this.altAudio = audio;
+      this.altAudioReady = false;
+      audio.addEventListener('canplay', () => {
+        if (token !== this.altAudioLoadToken || this.altAudio !== audio || this.altAudioReady) {
+          return;
+        }
+        this.altAudioReady = true;
+        const track = this.audioTracks.find((t) => t.index === streamIndex);
+        this.showToast(track ? this.audioTrackLabel(track) : '');
+        this.ensureVideoAudioGraph();
+        this.setVideoAudioSilenced(true);
+        audio.volume = this.player?.volume ?? 1;
+        audio.muted = this.player?.muted ?? false;
+        audio.playbackRate = this.player?.speed || 1;
+        this.syncAltAudioTime(true);
+        if (this.player?.playing) {
+          if (this.videoAudioCtx?.state === 'suspended') {
+            this.videoAudioCtx.resume().catch(() => {});
+          }
+          audio.play().catch(() => {});
+        }
+      });
+      audio.addEventListener('error', () => {
+        if (token !== this.altAudioLoadToken || this.altAudio !== audio) {
+          return;
+        }
+        console.error('Failed to load audio track', streamIndex, audio.error);
+        this.selectedAudioTrackIndex = null;
+        this.teardownAltAudio();
+        this.updateAudioTrackMenuChecked();
+        this.showToast('Failed to load audio track');
+      });
+      audio.load();
+    },
+    teardownAltAudio() {
+      this.altAudioLoadToken++;
+      if (this.altAudio) {
+        this.altAudio.pause();
+        this.altAudio.removeAttribute('src');
+        this.altAudio.load();
+        this.altAudio = null;
+      }
+      this.altAudioReady = false;
+      this.setVideoAudioSilenced(false);
+    },
+    ensureVideoAudioGraph() {
+      if (this.videoAudioGain || !this.mediaElement) {
+        return;
+      }
+      try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        const ctx = new Ctx();
+        const source = ctx.createMediaElementSource(this.mediaElement);
+        const gain = ctx.createGain();
+        source.connect(gain);
+        gain.connect(ctx.destination);
+        this.videoAudioCtx = ctx;
+        this.videoAudioGain = gain;
+      } catch (error) {
+        // Fall back to muting the element in setVideoAudioSilenced.
+        console.warn('Web Audio unavailable for audio track switching:', error);
+        this.videoAudioCtx = null;
+        this.videoAudioGain = null;
+      }
+    },
+    setVideoAudioSilenced(silenced) {
+      if (this.videoAudioGain) {
+        this.videoAudioGain.gain.value = silenced ? 0 : 1;
+        return;
+      }
+      if (this.previewType === 'video' && this.mediaElement) {
+        this.mediaElement.muted = silenced ? true : (this.player?.muted ?? false);
+      }
+    },
+    syncAltAudioTime(force) {
+      const audio = this.altAudio;
+      if (!audio || !this.altAudioReady || !this.player) {
+        return;
+      }
+      const target = this.player.currentTime || 0;
+      if (force || Math.abs(audio.currentTime - target) > 0.35) {
+        try {
+          audio.currentTime = target;
+        } catch {
+          // Track not seekable yet; the next timeupdate retries.
+        }
+      }
+    },
     getPlaybackModeLabel(mode) {
       switch (mode) {
         case 'single': return 'Play Once';
@@ -1038,14 +1280,20 @@ export default {
       const active = el.querySelector('.lyric-line.active');
       if (active) active.scrollIntoView({ behavior: 'smooth', block: 'center' });
     },
-    showToast() {
+    /** No message shows the playback-mode text; sticky keeps it visible until the next call. */
+    showToast(message = null, sticky = false) {
       if (this.toastTimeout) {
         clearTimeout(this.toastTimeout);
+        this.toastTimeout = null;
       }
+      this.toastMessage = message;
       this.toastVisible = true;
-      this.toastTimeout = setTimeout(() => {
-        this.toastVisible = false;
-      }, 1500);
+      if (!sticky) {
+        this.toastTimeout = setTimeout(() => {
+          this.toastVisible = false;
+          this.toastMessage = null;
+        }, 1500);
+      }
     },
     // Album art hover and scroll handlers
     onAlbumArtHover() {
@@ -1144,23 +1392,61 @@ export default {
       this.player.on('play', () => {
         mutations.setPlaybackState(true);
         this.updateMediaSessionPlaybackState();
+        if (this.altAudioReady && this.altAudio) {
+          if (this.videoAudioCtx?.state === 'suspended') {
+            this.videoAudioCtx.resume().catch(() => {});
+          }
+          this.syncAltAudioTime(false);
+          this.altAudio.play().catch(() => {});
+        }
       });
       this.player.on('pause', () => {
         mutations.setPlaybackState(false);
         this.updateMediaSessionPlaybackState();
+        if (this.altAudio) {
+          this.altAudio.pause();
+          this.syncAltAudioTime(true);
+        }
       });
       this.player.on('timeupdate', () => {
         this.updateMediaSessionPlaybackState();
         this.syncLyrics();
+        if (this.altAudioReady && this.player?.playing) {
+          this.syncAltAudioTime(false);
+        }
+      });
+      this.player.on('seeking', () => {
+        this.syncAltAudioTime(true);
       });
       this.player.on('seeked', () => {
         this.updateMediaSessionPlaybackState();
+        this.syncAltAudioTime(true);
       });
       this.player.on('loadedmetadata', () => {
         this.updateMediaSessionPlaybackState();
       });
       this.player.on('ratechange', () => {
         this.updateMediaSessionPlaybackState();
+        if (this.altAudio) {
+          this.altAudio.playbackRate = this.player?.speed || 1;
+        }
+      });
+      this.player.on('volumechange', () => {
+        if (this.altAudio) {
+          this.altAudio.volume = this.player?.volume ?? 1;
+          this.altAudio.muted = this.player?.muted ?? false;
+        }
+      });
+      this.player.on('waiting', () => {
+        if (this.altAudio) {
+          this.altAudio.pause();
+        }
+      });
+      this.player.on('playing', () => {
+        if (this.altAudioReady && this.altAudio && this.player?.playing) {
+          this.syncAltAudioTime(false);
+          this.altAudio.play().catch(() => {});
+        }
       });
       this.player.on('canplay', () => {
         this.updateMediaSessionPlaybackState();

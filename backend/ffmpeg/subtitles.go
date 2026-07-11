@@ -20,6 +20,7 @@ type FFProbeOutput struct {
 		Index       int               `json:"index"`
 		CodecType   string            `json:"codec_type"`
 		CodecName   string            `json:"codec_name"`
+		Channels    int               `json:"channels,omitempty"`
 		Tags        map[string]string `json:"tags,omitempty"`
 		Disposition map[string]int    `json:"disposition,omitempty"`
 	} `json:"streams"`

@@ -5,6 +5,16 @@ import (
 	"os"
 )
 
+type AudioTrack struct {
+	Name     string `json:"name"`               // descriptive name for the track
+	Language string `json:"language,omitempty"` // language code
+	Title    string `json:"title,omitempty"`    // title/description
+	Index    int    `json:"index"`              // stream index of the embedded audio track
+	Codec    string `json:"codec,omitempty"`    // codec name
+	Channels int    `json:"channels,omitempty"` // number of audio channels
+	Default  bool   `json:"default,omitempty"`  // true when the track has the default disposition
+}
+
 type SubtitleTrack struct {
 	Name     string `json:"name"`            // filename for external, or descriptive name for embedded
 	Language string `json:"language"`        // language code

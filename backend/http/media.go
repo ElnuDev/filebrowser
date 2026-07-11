@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -89,6 +90,75 @@ func subtitlesHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	w.Header().Set("Content-Disposition", "inline")
 	w.Header().Set("Cache-Control", "private")
 	http.ServeContent(w, r, name, time.Now(), bytes.NewReader([]byte(content)))
+	return http.StatusOK, nil
+}
+
+// audioTrackHandler serves an embedded audio track extracted from a video file.
+// @Summary Get an embedded audio track
+// @Description Extracts the requested embedded audio stream (stream-copied or transcoded to a browser-safe codec) and serves it with range support.
+// @Tags Resources
+// @Accept json
+// @Produce audio/*
+// @Param path query string true "Index path to the video file"
+// @Param source query string true "Source name for the desired source"
+// @Param index query int true "Stream index of the embedded audio track"
+// @Success 200 {file} file "Extracted audio track"
+// @Failure 400 {object} map[string]string "Bad request"
+// @Failure 403 {object} map[string]string "Forbidden"
+// @Failure 404 {object} map[string]string "Resource not found"
+// @Failure 500 {object} map[string]string "Internal server error"
+// @Router /api/media/audio [get]
+func audioTrackHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+	path := r.URL.Query().Get("path")
+	source := r.URL.Query().Get("source")
+	indexParam := r.URL.Query().Get("index")
+
+	if path == "" || source == "" {
+		return http.StatusBadRequest, fmt.Errorf("path and source are required")
+	}
+	streamIndex, err := strconv.Atoi(indexParam)
+	if err != nil {
+		return http.StatusBadRequest, fmt.Errorf("index parameter is required and must be an integer")
+	}
+
+	fileInfo, err := files.FileInfoFaster(utils.FileOptions{
+		FollowSymlinks:    true,
+		Path:              path,
+		Source:            source,
+		Expand:            true,
+		Content:           false,
+		Metadata:          false,
+		ShowHidden:        d.user.ShowHidden,
+		HideFileExt:       d.user.HideFileExt,
+		SkipExtendedAttrs: false,
+	}, store.Access, d.user, store.Share)
+	if err != nil {
+		return errToStatus(err), err
+	}
+	if !strings.HasPrefix(fileInfo.Type, "video") {
+		return http.StatusNotFound, fmt.Errorf("file is not a video")
+	}
+
+	var track *utils.AudioTrack
+	for _, t := range ffmpeg.DetectAudioTracks(fileInfo.RealPath, fileInfo.ModTime) {
+		if t.Index == streamIndex {
+			track = &t
+			break
+		}
+	}
+	if track == nil {
+		return http.StatusNotFound, fmt.Errorf("audio track %d not found", streamIndex)
+	}
+
+	trackPath, mime, err := ffmpeg.ExtractAudioTrack(r.Context(), fileInfo.RealPath, track.Index, track.Codec, fileInfo.ModTime)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+
+	w.Header().Set("Content-Type", mime)
+	w.Header().Set("Content-Disposition", "inline")
+	w.Header().Set("Cache-Control", "private, max-age=86400")
+	http.ServeFile(w, r, trackPath)
 	return http.StatusOK, nil
 }
 

@@ -686,6 +686,9 @@ export const mutations = {
     if (enriched.subtitles !== undefined) {
       next.subtitles = enriched.subtitles;
     }
+    if (enriched.audioTracks !== undefined) {
+      next.audioTracks = enriched.audioTracks;
+    }
     if (enriched.hasPreview !== undefined) {
       next.hasPreview = enriched.hasPreview;
     }
